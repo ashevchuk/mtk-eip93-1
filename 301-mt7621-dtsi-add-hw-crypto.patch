@@ -1,0 +1,17 @@
+--- a/arch/mips/boot/dts/mt7621.dtsi
++++ b/arch/mips/boot/dts/mt7621.dtsi
+@@ -543,4 +543,14 @@
+                        ranges;
+                };
+        };
++
++	crypto: crypto@1e004000 {
++		status = "okay";
++
++		compatible = "mediatek,mtk-eip93";
++		reg = <0x1E004000 0x1000>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 19 IRQ_TYPE_LEVEL_HIGH>;
++	};
+ };
