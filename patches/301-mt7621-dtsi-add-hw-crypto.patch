@@ -1,0 +1,20 @@
+diff --git a/target/linux/ramips/dts/mt7621.dtsi b/target/linux/ramips/dts/mt7621.dtsi
+index 77841a6..3ccc046 100644
+--- a/target/linux/ramips/dts/mt7621.dtsi
++++ b/target/linux/ramips/dts/mt7621.dtsi
+@@ -543,4 +543,14 @@
+                        ranges;
+                };
+        };
++
++       crypto: crypto@1e004000 {
++               status = "okay";
++
++               compatible = "mediatek,mtk-eip93";
++               reg = <0x1E004000 0x1000>;
++
++               interrupt-parent = <&gic>;
++               interrupts = <GIC_SHARED 19 IRQ_TYPE_LEVEL_HIGH>;
++       };
+ };
+
