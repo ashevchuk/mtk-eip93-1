@@ -25,14 +25,14 @@ define KernelPackage/crypto-hw-eip93
   DEPENDS:=@TARGET_ramips_mt7621
   TITLE:=Mediatek EIP93 crypto engine.
   FILES:=$(PKG_BUILD_DIR)/crypto-hw-eip93.ko
-#  AUTOLOAD:=$(call AutoProbe,crypto-hw-mtk-eip93)
+  AUTOLOAD:=$(call AutoProbe,crypto-hw-mtk-eip93)
 endef
 
 define KernelPackage/crypto-hw-eip93/description
 Asynchronous Kernel module to enable EIP-93 Crypto Engine
 in the Mediatek MT7621 SoC.
 endef
-  
+
 define Build/Compile
 	+$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" \
         CROSS_COMPILE="$(TARGET_CROSS)" \
