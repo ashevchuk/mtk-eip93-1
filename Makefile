@@ -1,15 +1,8 @@
-#
-# Copyright (C) 2006-2018 OpenWrt.org
-#
-# This is free software, licensed under the GNU General Public License v2.
-# See /LICENSE for more information.
-#
-
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
-PKG_NAME:=mtk-eip93
-PKG_RELEASE:=0.2
+PKG_NAME:=crypto-hw-eip93
+PKG_RELEASE:=0.4
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -22,15 +15,15 @@ endef
 define KernelPackage/crypto-hw-eip93
   $(call Package/crypto-hw-eip93/Default)
   SECTION:=kernel
-  DEPENDS:=@TARGET_ramips_mt7621
+  DEPENDS:=@TARGET_ramips_mt7621 +kmod-crypto-authenc +kmod-crypto-des
   TITLE:=Mediatek EIP93 crypto engine.
   FILES:=$(PKG_BUILD_DIR)/crypto-hw-eip93.ko
-  AUTOLOAD:=$(call AutoProbe,crypto-hw-mtk-eip93)
+  AUTOLOAD:=$(call AutoProbe,crypto-hw-eip93)
 endef
 
 define KernelPackage/crypto-hw-eip93/description
 Asynchronous Kernel module to enable EIP-93 Crypto Engine
-in the Mediatek MT7621 SoC.
+in the Mediatek MT7621 SoC
 endef
 
 define Build/Compile

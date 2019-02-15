@@ -1,366 +1,496 @@
-/*
- * Copyright (c) 2018 Richard van Schagen. All rights reserved.
+/* SPDX-License-Identifier: GPL-2.0
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation.
+ * Copyright (C) 2019
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Richard van Schagen <vschagen@cs.com>
  */
 
 #include <linux/device.h>
+#include <linux/dmapool.h>
 #include <linux/interrupt.h>
 #include <crypto/internal/hash.h>
 
-#include "common-eip93.h"
-#include "core-eip93.h"
+#include "eip93-common.h"
+#include "eip93-core.h"
 #include "eip93-hash.h"
+#include "eip93-ring.h"
 
 /* crypto hw padding constant for first operation */
 #define SHA_PADDING		64
 #define SHA_PADDING_MASK	(SHA_PADDING - 1)
 
-static LIST_HEAD(ahash_algs);
 
-static const u32 std_iv_sha1[SHA256_DIGEST_SIZE / sizeof(u32)] = {
-	SHA1_H0, SHA1_H1, SHA1_H2, SHA1_H3, SHA1_H4, 0, 0, 0
-};
-
-static const u32 std_iv_sha256[SHA256_DIGEST_SIZE / sizeof(u32)] = {
-	SHA256_H0, SHA256_H1, SHA256_H2, SHA256_H3,
-	SHA256_H4, SHA256_H5, SHA256_H6, SHA256_H7
-};
-
-static void mtk_ahash_done(void *data)
+static inline u64 mtk_queue_len(struct mtk_ahash_req *req)
 {
-/*
-	struct crypto_async_request *async_req = data;
-	struct ahash_request *req = ahash_request_cast(async_req);
-	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	struct mtk_alg_template *tmpl = to_ahash_tmpl(async_req->tfm);
-	struct mtk_device *mtk = tmpl->mtk;
-	struct mtk_result_dump *result = mtk->dma.result_buf;
-	unsigned int digestsize = crypto_ahash_digestsize(ahash);
-	int error;
-	u32 status;
+	if (req->len[1] > req->processed[1])
+		return 0xffffffff - (req->len[0] - req->processed[0]);
 
-	dma_unmap_sg(mtk->dev, req->src, rctx->src_nents, DMA_TO_DEVICE);
-	dma_unmap_sg(mtk->dev, &rctx->result_sg, 1, DMA_FROM_DEVICE);
-
-	memcpy(rctx->digest, result->auth_iv, digestsize);
-	if (req->result)
-		memcpy(req->result, result->auth_iv, digestsize);
-
-	rctx->byte_count[0] = cpu_to_be32(result->auth_byte_count[0]);
-	rctx->byte_count[1] = cpu_to_be32(result->auth_byte_count[1]);
-
-	error = mtk_check_status(mtk, &status);
-	if (error < 0)
-		dev_dbg(mtk->dev, "ahash operation error (%x)\n", status);
-
-	req->src = rctx->src_orig;
-	req->nbytes = rctx->nbytes_orig;
-	rctx->last_blk = false;
-	rctx->first_blk = false;
-
-	mtk->async_req_done(tmpl->mtk, error);
-*/
+	return req->len[0] - req->processed[0];
 }
+static int mtk_ahash_handle_result(struct mtk_device *mtk,
+				  struct crypto_async_request *async,
+				  bool *should_complete, int *ret)
 
-static int mtk_ahash_async_req_handle(struct crypto_async_request *async_req)
 {
-/*
-	struct ahash_request *req = ahash_request_cast(async_req);
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	struct mtk_sha_ctx *ctx = crypto_tfm_ctx(async_req->tfm);
-	struct mtk_alg_template *tmpl = to_ahash_tmpl(async_req->tfm);
-	struct mtk_device *mtk = tmpl->mtk;
-	unsigned long flags = rctx->flags;
-	int ret;
+	struct eip93_desciptor *rdesc;
+	struct ahash_request *areq = ahash_request_cast(async);
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	struct mtk_ahash_req *sreq = ahash_request_ctx(areq);
+	int cache_len, result_sz = sreq->state_sz;
 
-	if (IS_SHA_HMAC(flags)) {
-		rctx->authkey = ctx->authkey;
-		rctx->authklen = MTK_SHA_HMAC_KEY_SIZE;
-	} else if (IS_CMAC(flags)) {
-		rctx->authkey = ctx->authkey;
-		rctx->authklen = AES_KEYSIZE_128;
+	*ret = 0;
+
+	rdesc = mtk_ring_next_rptr(mtk, &mtk->ring[0].rdr);
+	if (IS_ERR(rdesc)) {
+		dev_err(mtk->dev,
+			"hash: result: could not retrieve result descriptor\n");
+		*ret = PTR_ERR(rdesc);
+	} else if (rdesc->peCrtlStat.bits.errStatus) {
+		dev_err(mtk->dev,
+			"hash: result: result descriptor error (%d)\n",
+			rdesc->peCrtlStat.bits.errStatus);
+		*ret = -EINVAL;
 	}
 
-	rctx->src_nents = sg_nents_for_len(req->src, req->nbytes);
-	if (rctx->src_nents < 0) {
-		dev_err(mtk->dev, "Invalid numbers of src SG.\n");
-		return rctx->src_nents;
+/*	safexcel_complete(priv, ring);
+
+	if (sreq->nents) {
+		dma_unmap_sg(priv->dev, areq->src, sreq->nents, DMA_TO_DEVICE);
+		sreq->nents = 0;
 	}
 
-	ret = dma_map_sg(mtk->dev, req->src, rctx->src_nents, DMA_TO_DEVICE);
-	if (ret < 0)
-		return ret;
-
-	sg_init_one(&rctx->result_sg, mtk->dma.result_buf, MTK_RESULT_BUF_SZ);
-
-	ret = dma_map_sg(mtk->dev, &rctx->result_sg, 1, DMA_FROM_DEVICE);
-	if (ret < 0)
-		goto error_unmap_src;
-
-	ret = mtk_dma_prep_sgs(&mtk->dma, req->src, rctx->src_nents,
-			       &rctx->result_sg, 1, mtk_ahash_done, async_req);
-	if (ret)
-		goto error_unmap_dst;
-
-	mtk_dma_issue_pending(&mtk->dma);
-
-	ret = mtk_start(async_req, tmpl->crypto_alg_type, 0, 0);
-	if (ret)
-		goto error_terminate;
-*/
-	return 0;
-/*
-error_terminate:
-//	mtk_dma_terminate_all(&mtk->dma);
-error_unmap_dst:
-	dma_unmap_sg(mtk->dev, &rctx->result_sg, 1, DMA_FROM_DEVICE);
-error_unmap_src:
-	dma_unmap_sg(mtk->dev, req->src, rctx->src_nents, DMA_TO_DEVICE);
-	return ret;
-*/
-}
-
-static int mtk_ahash_init(struct ahash_request *req)
-{
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	struct mtk_alg_template *tmpl = to_ahash_tmpl(req->base.tfm);
-	const u32 *std_iv = tmpl->std_iv;
-
-	memset(rctx, 0, sizeof(*rctx));
-	rctx->first_blk = true;
-	rctx->last_blk = false;
-	rctx->flags = tmpl->alg_flags;
-	memcpy(rctx->digest, std_iv, sizeof(rctx->digest));
-
-	return 0;
-}
-
-static int mtk_ahash_export(struct ahash_request *req, void *out)
-{
-/*
-	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	unsigned long flags = rctx->flags;
-	unsigned int digestsize = crypto_ahash_digestsize(ahash);
-	unsigned int blocksize =
-			crypto_tfm_alg_blocksize(crypto_ahash_tfm(ahash));
-
-	if (IS_SHA1(flags) || IS_SHA1_HMAC(flags)) {
-		struct sha1_state *out_state = out;
-
-		out_state->count = rctx->count;
-		mtk_cpu_to_be32p_array((__be32 *)out_state->state,
-				       rctx->digest, digestsize);
-		memcpy(out_state->buffer, rctx->buf, blocksize);
-	} else if (IS_SHA256(flags) || IS_SHA256_HMAC(flags)) {
-		struct sha256_state *out_state = out;
-
-		out_state->count = rctx->count;
-		mtk_cpu_to_be32p_array((__be32 *)out_state->state,
-				       rctx->digest, digestsize);
-		memcpy(out_state->buf, rctx->buf, blocksize);
-	} else {
-		return -EINVAL;
+	if (sreq->result_dma) {
+		dma_unmap_sg(priv->dev, areq->src, sreq->nents, DMA_TO_DEVICE);
+		sreq->result_dma = 0;
 	}
 */
-	return 0;
+	if (sreq->finish) {
+		memcpy(areq->result, sreq->state,
+				crypto_ahash_digestsize(ahash));
+	}
+
+	cache_len = mtk_queued_len(sreq);
+	if (cache_len)
+		memcpy(sreq->cache, sreq->cache_next, cache_len);
+
+	*should_complete = true;
+
+	return 1;
 }
 
-static int mtk_import_common(struct ahash_request *req, u64 in_count,
-			     const u32 *state, const u8 *buffer, bool hmac)
+static int mtk_ahash_send(struct crypto_async_request *async,
+				   struct mtk_request *request,
+				   int *commands, int *results)
 {
-/*
-	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	unsigned int digestsize = crypto_ahash_digestsize(ahash);
-	unsigned int blocksize;
-	u64 count = in_count;
+	struct ahash_request *areq = ahash_request_cast(async);
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	struct mtk_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
+	struct mtk_crypto_priv *priv = ctx->priv;
+	struct eip93_descriptor *cdesc, *first_cdesc = NULL;
+	struct eip93_descriptor *rdesc;
+	struct scatterlist *sg;
+	int i, queued, len, cache_len, extra, n_cdesc = 0, ret = 0;
 
-	blocksize = crypto_tfm_alg_blocksize(crypto_ahash_tfm(ahash));
-	rctx->count = in_count;
-	memcpy(rctx->buf, buffer, blocksize);
+	queued = len = req->len - req->processed;
+	if (queued <= crypto_ahash_blocksize(ahash))
+		cache_len = queued;
+	else
+		cache_len = queued - areq->nbytes;
 
-	if (in_count <= blocksize) {
-		rctx->first_blk = 1;
-	} else {
-		rctx->first_blk = 0;
-		//
-		// For HMAC, there is a hardware padding done when first block
-		// is set. Therefore the byte_count must be incremened by 64
-		// after the first block operation.
-		//
+	if (!req->last_req) {
+		/* If this is not the last request and the queued data does not
+		 * fit into full blocks, cache it for the next send() call.
+		 */
+		extra = queued & (crypto_ahash_blocksize(ahash) - 1);
+		if (!extra)
+			/* If this is not the last request and the queued data
+			 * is a multiple of a block, cache the last one for now.
+			 */
+			extra = crypto_ahash_blocksize(ahash);
 
-		if (hmac)
-			count += SHA_PADDING;
+		if (extra) {
+			sg_pcopy_to_buffer(areq->src, sg_nents(areq->src),
+					   req->cache_next, extra,
+					   areq->nbytes - extra);
+
+			queued -= extra;
+			len -= extra;
+
+			if (!queued) {
+				*commands = 0;
+				*results = 0;
+				return 0;
+			}
+		}
 	}
 
-	rctx->byte_count[0] = (__force __be32)(count & ~SHA_PADDING_MASK);
-	rctx->byte_count[1] = (__force __be32)(count >> 32);
-	mtk_cpu_to_be32p_array((__be32 *)rctx->digest, (const u8 *)state,
-			       digestsize);
-	rctx->buflen = (unsigned int)(in_count & (blocksize - 1));
-*/
-	return 0;
-}
+	/* Add a command descriptor for the cached data, if any */
+	if (cache_len) {
+		req->cache_dma = kzalloc(cache_len, EIP197_GFP_FLAGS(*async));
+		if (!ctx->base.cache) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+		memcpy(ctx->base.cache, req->cache, cache_len);
+		ctx->base.cache_dma = dma_map_single(priv->dev, ctx->base.cache,
+						     cache_len, DMA_TO_DEVICE);
+		if (dma_mapping_error(priv->dev, ctx->base.cache_dma)) {
+			ret = -EINVAL;
+			goto free_cache;
+		}
 
-static int mtk_ahash_import(struct ahash_request *req, const void *in)
-{
-/*
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	unsigned long flags = rctx->flags;
-	bool hmac = IS_SHA_HMAC(flags);
-	int ret = -EINVAL;
+		ctx->base.cache_sz = cache_len;
+		first_cdesc = mtk_add_cdesc(mtk, ctx->base.cache_dma,
+							Result.base, saRecord.base, saState.base,
+							cache_len, 0);
 
-	if (IS_SHA1(flags) || IS_SHA1_HMAC(flags)) {
-		const struct sha1_state *state = in;
+		if (IS_ERR(first_cdesc)) {
+			ret = PTR_ERR(first_cdesc);
+			goto unmap_cache;
+		}
+		rdesc = mtk_add_rdesc(mtk);
+		n_cdesc++;
 
-		ret = mtk_import_common(req, state->count, state->state,
-					state->buffer, hmac);
-	} else if (IS_SHA256(flags) || IS_SHA256_HMAC(flags)) {
-		const struct sha256_state *state = in;
-
-		ret = mtk_import_common(req, state->count, state->state,
-					state->buf, hmac);
-	}
-	return ret;
-*/
-	return 0;
-}
-
-static int mtk_ahash_update(struct ahash_request *req)
-{
-/*
-	struct crypto_ahash *tfm = crypto_ahash_reqtfm(req);
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	struct mtk_alg_template *tmpl = to_ahash_tmpl(req->base.tfm);
-	struct mtk_device *mtk = tmpl->mtk;
-	struct scatterlist *sg_last, *sg;
-	unsigned int total, len;
-	unsigned int hash_later;
-	unsigned int nbytes;
-	unsigned int blocksize;
-
-	blocksize = crypto_tfm_alg_blocksize(crypto_ahash_tfm(tfm));
-	rctx->count += req->nbytes;
-
-	// check for buffer from previous updates and append it 
-	total = req->nbytes + rctx->buflen;
-
-	if (total <= blocksize) {
-		scatterwalk_map_and_copy(rctx->buf + rctx->buflen, req->src,
-					 0, req->nbytes, 0);
-		rctx->buflen += req->nbytes;
-		return 0;
+		queued -= cache_len;
+		if (!queued)
+			goto send_command;
 	}
 
-	// save the original req structure fields //
-	rctx->src_orig = req->src;
-	rctx->nbytes_orig = req->nbytes;
-
-	//
-	// if we have data from previous update copy them on buffer. The old
-	// data will be combined with current request bytes.
-	//
-	if (rctx->buflen)
-		memcpy(rctx->tmpbuf, rctx->buf, rctx->buflen);
-
-	// calculate how many bytes will be hashed later //
-	hash_later = total % blocksize;
-	if (hash_later) {
-		unsigned int src_offset = req->nbytes - hash_later;
-		scatterwalk_map_and_copy(rctx->buf, req->src, src_offset,
-					 hash_later, 0);
+	/* Now handle the current ahash request buffer(s) */
+	req->nents = dma_map_sg(priv->dev, areq->src,
+				sg_nents_for_len(areq->src, areq->nbytes),
+				DMA_TO_DEVICE);
+	if (!req->nents) {
+		ret = -ENOMEM;
+		goto cdesc_rollback;
 	}
 
-	// here nbytes is multiple of blocksize //
-	nbytes = total - hash_later;
+	for_each_sg(areq->src, sg, req->nents, i) {
+		int sglen = sg_dma_len(sg);
 
-	len = rctx->buflen;
-	sg = sg_last = req->src;
+		/* Do not overflow the request */
+		if (queued - sglen < 0)
+			sglen = queued;
 
-	while (len < nbytes && sg) {
-		if (len + sg_dma_len(sg) > nbytes)
+		cdesc = mtk_add_cdesc(mtk, sg_dma_address(sg), Result.base,
+						saRecord.base, saState.base, sglen, 0);
+		if (IS_ERR(cdesc)) {
+			ret = PTR_ERR(cdesc);
+			goto cdesc_rollback;
+		}
+		rdesc = mtk_add_rdesc(mtk);
+
+		n_cdesc++;
+
+		if (n_cdesc == 1)
+			first_cdesc = cdesc;
+
+		queued -= sglen;
+		if (!queued)
 			break;
-		len += sg_dma_len(sg);
-		sg_last = sg;
-		sg = sg_next(sg);
 	}
 
-	if (!sg_last)
-		return -EINVAL;
+send_command:
 
-	sg_mark_end(sg_last);
+	spin_unlock_bh(&priv->ring[ring].egress_lock);
 
-	if (rctx->buflen) {
-		sg_init_table(rctx->sg, 2);
-		sg_set_buf(rctx->sg, rctx->tmpbuf, rctx->buflen);
-		sg_chain(rctx->sg, 2, req->src);
-		req->src = rctx->sg;
-	}
+	req->processed += len;
+	request->req = &areq->base;
 
-	req->nbytes = nbytes;
-	rctx->buflen = hash_later;
-
-	return mtk->async_req_enqueue(tmpl->mtk, &req->base);
-*/
+	*commands = n_cdesc;
+	*results = 1;
 	return 0;
+
+unmap_result:
+
+unmap_sg:
+
+cdesc_rollback:
+	for (i = 0; i < n_cdesc; i++)
+		mtk_ring_rollback_wptr(priv, &priv->ring[ring].cdr);
+unmap_cache:
+	if (req->bcache_dma) {
+		dma_unmap_single(priv->dev, ctx->base.cache_dma,
+				 ctx->base.cache_sz, DMA_TO_DEVICE);
+		req->cache_sz = 0;
+	}
+
+	return ret;
 }
 
-static int mtk_ahash_final(struct ahash_request *req)
+static int mtk_ahash_enqueue(struct ahash_request *areq)
 {
-/*
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	struct mtk_alg_template *tmpl = to_ahash_tmpl(req->base.tfm);
-	struct mtk_device *mtk = tmpl->mtk;
+	struct mtk_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	struct mtk_crypto_priv *priv = ctx->priv;
+	int ret, ring;
 
-	if (!rctx->buflen)
+
+	spin_lock_bh(&mtk->ring[0].queue_lock);
+	ret = crypto_enqueue_request(&mtk->ring[0].queue, &areq->base);
+	spin_unlock_bh(&mtk->ring[0].queue_lock);
+
+	queue_work(mtk->ring[0].workqueue, &mtk->ring[0].work_data.work);
+
+	return ret;
+}
+
+static int mtk_ahash_cache(struct ahash_request *areq)
+{
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	int queued, cache_len;
+
+	cache_len = req->len - areq->nbytes - req->processed;
+	queued = req->len - req->processed;
+
+	/*
+	 * In case there isn't enough bytes to proceed (less than a
+	 * block size), cache the data until we have enough.
+	 */
+	if (cache_len + areq->nbytes <= crypto_ahash_blocksize(ahash)) {
+		sg_pcopy_to_buffer(areq->src, sg_nents(areq->src),
+				   req->cache + cache_len,
+				   areq->nbytes, 0);
+		return areq->nbytes;
+	}
+
+	/* We could'nt cache all the data */
+	return -E2BIG;
+}
+
+static int mtk_ahash_update(struct ahash_request *areq)
+{
+	struct mtk_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+
+	/* If the request is 0 length, do nothing */
+	if (!areq->nbytes)
 		return 0;
 
-	rctx->last_blk = true;
+	req->len += areq->nbytes;
 
-	rctx->src_orig = req->src;
-	rctx->nbytes_orig = req->nbytes;
+	mtk_ahash_cache(areq);
 
-	memcpy(rctx->tmpbuf, rctx->buf, rctx->buflen);
-	sg_init_one(rctx->sg, rctx->tmpbuf, rctx->buflen);
+	/*
+	 * We're not doing partial updates when performing an hmac request.
+	 * Everything will be handled by the final() call.
+	 */
+	if (ctx->digest == )
+		return 0;
 
-	req->src = rctx->sg;
-	req->nbytes = rctx->buflen;
+	if (req->hmac)
+		return mtk_ahash_enqueue(areq);
 
-	return mtk->async_req_enqueue(tmpl->mtk, &req->base);
-*/
+	if (!req->last_req &&
+	    req->len - req->processed > crypto_ahash_blocksize(ahash))
+		return safexcel_ahash_enqueue(areq);
+
 	return 0;
 }
 
-static int mtk_ahash_digest(struct ahash_request *req)
+static int mtk_ahash_final(struct ahash_request *areq)
 {
-/*
-	struct mtk_sha_reqctx *rctx = ahash_request_ctx(req);
-	struct mtk_alg_template *tmpl = to_ahash_tmpl(req->base.tfm);
-	struct mtk_device *mtk = tmpl->mtk;
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	struct mtk_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
+
+	req->last_req = true;
+	req->finish = true;
+
+	/* If we have an overall 0 length request */
+	if (!(req->len + areq->nbytes)) {
+		if (IS_SHA1(req->flags))
+			memcpy(areq->result, sha1_zero_message_hash,
+			       SHA1_DIGEST_SIZE);
+		else if (IS_SHA224(req->flags))
+			memcpy(areq->result, sha224_zero_message_hash,
+			       SHA224_DIGEST_SIZE);
+		else if (IS_SHA256(req->flags))
+			memcpy(areq->result, sha256_zero_message_hash,
+			       SHA256_DIGEST_SIZE);
+		return 0;
+	}
+
+	return mtk_ahash_enqueue(areq);
+}
+
+static int mtk_ahash_finup(struct ahash_request *areq)
+{
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+
+	req->last_req = true;
+	req->finish = true;
+
+	mtk_ahash_update(areq);
+	return mtk_ahash_final(areq);
+}
+
+static int mtk_ahash_export(struct ahash_request *areq, void *out)
+{
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	struct mtk_ahash_export_state *export = out;
+
+	export->len = req->len;
+	export->processed = req->processed;
+
+	memcpy(export->state, req->state, req->state_sz);
+	memset(export->cache, 0, crypto_ahash_blocksize(ahash));
+	memcpy(export->cache, req->cache, crypto_ahash_blocksize(ahash));
+
+	return 0;
+}
+
+static int mtk_ahash_import(struct ahash_request *areq, const void *in)
+{
+	struct crypto_ahash *ahash = crypto_ahash_reqtfm(areq);
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+	const struct mtk_ahash_export_state *export = in;
 	int ret;
 
-	ret = mtk_ahash_init(req);
+	ret = crypto_ahash_init(areq);
 	if (ret)
 		return ret;
 
-	rctx->src_orig = req->src;
-	rctx->nbytes_orig = req->nbytes;
-	rctx->first_blk = true;
-	rctx->last_blk = true;
+	req->len = export->len;
+	req->processed = export->processed;
 
-	return mtk->async_req_enqueue(tmpl->mtk, &req->base);
-*/
+	memcpy(req->cache, export->cache, crypto_ahash_blocksize(ahash));
+	memcpy(req->state, export->state, req->state_sz);
+
 	return 0;
+}
+
+static int mtk_hmac_setkey(struct crypto_ahash *tfm, const u8 *key,
+			  u32 keylen)
+{
+	struct mtk_ahash_ctx *ctx = crypto_ahash_ctx(tfm);
+	int bs = crypto_shash_blocksize(ctx->shash);
+	int ds = crypto_shash_digestsize(ctx->shash);
+	int ss = crypto_shash_statesize(ctx->shash);
+	char *ipad = crypto_shash_ctx_aligned(ctx->shash);
+	char *opad = ipad + ss;
+	struct crypto_shash *hash = ctx->shash;
+	SHASH_DESC_ON_STACK(shash, hash);
+	unsigned int i, err;
+
+	/*
+	 * EIP93 can only authenticate with hash of the key
+	 * do software shash until EIP93 hash function complete.
+	 */
+
+	shash->tfm = hash;
+	shash->flags = crypto_shash_get_flags(ctx->shash)
+		& CRYPTO_TFM_REQ_MAY_SLEEP;
+
+	if (keys.authkeylen > bs) {
+		int err;
+
+		err = crypto_shash_digest(shash, keys.authkey,
+					keys.authkeylen, ipad);
+
+		if (err)
+			return err;
+
+		keys.authkeylen = ds;
+	} else
+		memcpy(ipad, keys.authkey, keys.authkeylen);
+
+	memset(ipad + keys.authkeylen, 0, bs - keys.authkeylen);
+	memcpy(opad, ipad, bs);
+
+	for (i = 0; i < bs; i++) {
+		ipad[i] ^= HMAC_IPAD_VALUE;
+		opad[i] ^= HMAC_OPAD_VALUE;
+	}
+
+	err = crypto_shash_init(shash) ?:
+	       crypto_shash_update(shash, ipad, bs) ?:
+	       crypto_shash_export(shash, ipad) ?:
+	       crypto_shash_init(shash) ?:
+	       crypto_shash_update(shash, opad, bs) ?:
+	       crypto_shash_export(shash, opad);
+
+	memcpy(ctx->ipad, ipad, SHA256_DIGEST_SIZE);
+	memcpy(ctx->opad, opad, SHA256_DIGEST_SIZE);
+
+	return 0;
+
+badkey:
+	crypto_aead_set_flags(ctfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
+	return -EINVAL;
+}
+
+static int mtk_ahash_cra_init(struct crypto_tfm *tfm)
+{
+	struct mtk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
+	struct ahash_alg *alg = __crypto_ahash_alg(tfm->__crt_alg) 
+	struct mtk_alg_template *tmpl = container_of(alg,
+			     struct mtk_alg_template, alg.ahash);
+	struct mtk_device*mtk = tmpl->mtk;
+	unsigned long flags = tmpl->flags;
+	char *alg_base;
+
+	ctx->mtk = mtk;
+
+	crypto_ahash_set_reqsize(__crypto_ahash_cast(tfm),
+				 sizeof(struct mtk_ahash_req));
+
+	ctx->base.send = mtk_ahash_send;
+	ctx->base.handle_result = mtk_ahash_handle_result;
+
+	if IS_HMAC(flags) {
+		if IS_HASH_SHA1(flags)
+			alg_base = "sha1";
+		if IS_HASH_SHA224(flags)
+			alg_base = "sha224";
+		if IS_HASH_SHA256(flags)
+			alg_base = "sha256";
+
+		ctx->shash = crypto_alloc_shash(alg_base, 0,
+					CRYPTO_ALG_NEED_FALLBACK);
+		if (IS_ERR(ctx->shash)) {
+			dev_err(mtk->dev,
+				"base driver %s could not be loaded.\n", alg_base);
+			return PTR_ERR(ctx->shash);
+		}
+	}
+	return 0;
+}
+
+static int mtk_ahash_init(struct ahash_request *areq)
+{
+	struct mtk_ahash_ctx *ctx = crypto_ahash_ctx(crypto_ahash_reqtfm(areq));
+	struct mtk_ahash_req *req = ahash_request_ctx(areq);
+
+	memset(req, 0, sizeof(*req));
+
+	
+	ctx->alg = CONTEXT_CONTROL_CRYPTO_ALG_SHA1;
+	ctx->digest = CONTEXT_CONTROL_DIGEST_PRECOMPUTED;
+	req->state_sz = SHA1_DIGEST_SIZE;
+
+	return 0;
+}
+
+static int mtk_ahash_digest(struct ahash_request *areq)
+{
+	int ret = mtk_ahash_init(areq);
+
+	if (ret)
+		return ret;
+
+	return mtk_ahash_finup(areq);
+}
+
+static void mtk_ahash_cra_exit(struct crypto_tfm *tfm)
+{
+	struct mtk_ahash_ctx *ctx = crypto_tfm_ctx(tfm);
+	struct mtk_device *mtk = ctx->mtk;
+	int ret;
+
 }
 
 struct mtk_ahash_result {
@@ -368,9 +498,8 @@ struct mtk_ahash_result {
 	int error;
 };
 
-static void mtk_digest_complete(struct crypto_async_request *req, int error)
+static void mtk_ahash_complete(struct crypto_async_request *req, int error)
 {
-/*
 	struct mtk_ahash_result *result = req->data;
 
 	if (error == -EINPROGRESS)
@@ -378,228 +507,183 @@ static void mtk_digest_complete(struct crypto_async_request *req, int error)
 
 	result->error = error;
 	complete(&result->completion);
-*/
 }
 
-static int mtk_ahash_hmac_setkey(struct crypto_ahash *tfm, const u8 *key,
-				 unsigned int keylen)
-{
-	unsigned int digestsize = crypto_ahash_digestsize(tfm);
-	struct mtk_sha_ctx *ctx = crypto_tfm_ctx(&tfm->base);
-	struct mtk_ahash_result result;
-	struct ahash_request *req;
-	struct scatterlist sg;
-	unsigned int blocksize;
-	struct crypto_ahash *ahash_tfm;
-	u8 *buf;
-	int ret;
-	const char *alg_name;
 
-	blocksize = crypto_tfm_alg_blocksize(crypto_ahash_tfm(tfm));
-	memset(ctx->authkey, 0, sizeof(ctx->authkey));
-
-	if (keylen <= blocksize) {
-		memcpy(ctx->authkey, key, keylen);
-		return 0;
-	}
-
-	if (digestsize == SHA1_DIGEST_SIZE)
-		alg_name = "sha1-mtk";
-	else if (digestsize == SHA256_DIGEST_SIZE)
-		alg_name = "sha256-mtk";
-	else
-		return -EINVAL;
-
-	ahash_tfm = crypto_alloc_ahash(alg_name, CRYPTO_ALG_TYPE_AHASH,
-				       CRYPTO_ALG_TYPE_AHASH_MASK);
-	if (IS_ERR(ahash_tfm))
-		return PTR_ERR(ahash_tfm);
-
-	req = ahash_request_alloc(ahash_tfm, GFP_KERNEL);
-	if (!req) {
-		ret = -ENOMEM;
-		goto err_free_ahash;
-	}
-
-	init_completion(&result.completion);
-	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-				   mtk_digest_complete, &result);
-	crypto_ahash_clear_flags(ahash_tfm, ~0);
-
-	buf = kzalloc(keylen + MTK_MAX_ALIGN_SIZE, GFP_KERNEL);
-	if (!buf) {
-		ret = -ENOMEM;
-		goto err_free_req;
-	}
-
-	memcpy(buf, key, keylen);
-	sg_init_one(&sg, buf, keylen);
-	ahash_request_set_crypt(req, &sg, ctx->authkey, keylen);
-
-	ret = crypto_ahash_digest(req);
-	if (ret == -EINPROGRESS || ret == -EBUSY) {
-		ret = wait_for_completion_interruptible(&result.completion);
-		if (!ret)
-			ret = result.error;
-	}
-
-	if (ret)
-		crypto_ahash_set_flags(tfm, CRYPTO_TFM_RES_BAD_KEY_LEN);
-
-	kfree(buf);
-err_free_req:
-	ahash_request_free(req);
-err_free_ahash:
-	crypto_free_ahash(ahash_tfm);
-	return ret;
-}
-
-static int mtk_ahash_cra_init(struct crypto_tfm *tfm)
-{
-	struct crypto_ahash *ahash = __crypto_ahash_cast(tfm);
-	struct mtk_sha_ctx *ctx = crypto_tfm_ctx(tfm);
-
-	crypto_ahash_set_reqsize(ahash, sizeof(struct mtk_sha_reqctx));
-	memset(ctx, 0, sizeof(*ctx));
-	return 0;
-}
-
-struct mtk_ahash_def {
-	unsigned long flags;
-	const char *name;
-	const char *drv_name;
-	unsigned int digestsize;
-	unsigned int blocksize;
-	unsigned int statesize;
-	const u32 *std_iv;
-};
-
-static const struct mtk_ahash_def ahash_def[] = {
-	{
-		.flags		= MTK_HASH_SHA1,
-		.name		= "sha1",
-		.drv_name	= "eip93-sha1",
-		.digestsize	= SHA1_DIGEST_SIZE,
-		.blocksize	= SHA1_BLOCK_SIZE,
-		.statesize	= sizeof(struct sha1_state),
-		.std_iv		= std_iv_sha1,
-	},
-	{
-		.flags		= MTK_HASH_SHA256,
-		.name		= "sha256",
-		.drv_name	= "eip93-sha256",
-		.digestsize	= SHA256_DIGEST_SIZE,
-		.blocksize	= SHA256_BLOCK_SIZE,
-		.statesize	= sizeof(struct sha256_state),
-		.std_iv		= std_iv_sha256,
-	},
-	{
-		.flags		= MTK_HASH_SHA1_HMAC,
-		.name		= "hmac(sha1)",
-		.drv_name	= "eip93-hmac-sha1",
-		.digestsize	= SHA1_DIGEST_SIZE,
-		.blocksize	= SHA1_BLOCK_SIZE,
-		.statesize	= sizeof(struct sha1_state),
-		.std_iv		= std_iv_sha1,
-	},
-	{
-		.flags		= MTK_HASH_SHA256_HMAC,
-		.name		= "hmac(sha256)",
-		.drv_name	= "eip93-hmac-sha256",
-		.digestsize	= SHA256_DIGEST_SIZE,
-		.blocksize	= SHA256_BLOCK_SIZE,
-		.statesize	= sizeof(struct sha256_state),
-		.std_iv		= std_iv_sha256,
+struct mtk_alg_template mtk_alg_sha1 = {
+	.type = MTK_ALG_TYPE_AHASH,
+	.flags = MTK_HASH_SHA1,
+	.alg.ahash = {
+		.init = mtk_ahash_init,
+		.update = mtk_ahash_update,
+		.final = mtk_ahash_final,
+		.finup = mtk_ahash_finup,
+		.digest = mtk_ahash_digest,
+		.export = mtk_ahash_export,
+		.import = mtk_ahash_import,
+		.halg = {
+			.digestsize = SHA1_DIGEST_SIZE,
+			.statesize = sizeof(struct mtk_ahash_export_state),
+			.base = {
+				.cra_name = "sha1",
+				.cra_driver_name = "eip93-sha1",
+				.cra_priority = 300,
+				.cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
+				.cra_blocksize = SHA1_BLOCK_SIZE,
+				.cra_ctxsize = sizeof(struct mtk_ahash_ctx),
+				.cra_init = mtk_ahash_cra_init,
+				.cra_exit = mtk_ahash_cra_exit,
+				.cra_module = THIS_MODULE,
+			},
+		},
 	},
 };
 
-static int mtk_ahash_register_one(const struct mtk_ahash_def *def,
-				  struct mtk_device *mtk)
-{
-	struct mtk_alg_template *tmpl;
-	struct ahash_alg *alg;
-	struct crypto_alg *base;
-	int ret;
-
-	tmpl = kzalloc(sizeof(*tmpl), GFP_KERNEL);
-	if (!tmpl)
-		return -ENOMEM;
-
-	tmpl->std_iv = def->std_iv;
-
-	alg = &tmpl->alg.ahash;
-	alg->init = mtk_ahash_init;
-	alg->update = mtk_ahash_update;
-	alg->final = mtk_ahash_final;
-	alg->digest = mtk_ahash_digest;
-	alg->export = mtk_ahash_export;
-	alg->import = mtk_ahash_import;
-	if (IS_SHA_HMAC(def->flags))
-		alg->setkey = mtk_ahash_hmac_setkey;
-	alg->halg.digestsize = def->digestsize;
-	alg->halg.statesize = def->statesize;
-
-	base = &alg->halg.base;
-	base->cra_blocksize = def->blocksize;
-	base->cra_priority = 300;
-	base->cra_flags = CRYPTO_ALG_ASYNC;
-	base->cra_ctxsize = sizeof(struct mtk_sha_ctx);
-	base->cra_alignmask = 0;
-	base->cra_module = THIS_MODULE;
-	base->cra_init = mtk_ahash_cra_init;
-	INIT_LIST_HEAD(&base->cra_list);
-
-	snprintf(base->cra_name, CRYPTO_MAX_ALG_NAME, "%s", def->name);
-	snprintf(base->cra_driver_name, CRYPTO_MAX_ALG_NAME, "%s",
-		 def->drv_name);
-
-	INIT_LIST_HEAD(&tmpl->entry);
-	tmpl->crypto_alg_type = CRYPTO_ALG_TYPE_AHASH;
-	tmpl->alg_flags = def->flags;
-	tmpl->mtk = mtk;
-
-	ret = crypto_register_ahash(alg);
-	if (ret) {
-		kfree(tmpl);
-		dev_err(mtk->dev, "%s registration failed\n", base->cra_name);
-		return ret;
-	}
-
-	list_add_tail(&tmpl->entry, &ahash_algs);
-	dev_dbg(mtk->dev, "%s is registered\n", base->cra_name);
-	return 0;
-}
-
-static void mtk_ahash_unregister(struct mtk_device *mtk)
-{
-	struct mtk_alg_template *tmpl, *n;
-
-	list_for_each_entry_safe(tmpl, n, &ahash_algs, entry) {
-		crypto_unregister_ahash(&tmpl->alg.ahash);
-		list_del(&tmpl->entry);
-		kfree(tmpl);
-	}
-}
-
-static int mtk_ahash_register(struct mtk_device *mtk)
-{
-	int ret, i;
-
-	for (i = 0; i < ARRAY_SIZE(ahash_def); i++) {
-		ret = mtk_ahash_register_one(&ahash_def[i], mtk);
-		if (ret)
-			goto err;
-	}
-
-	return 0;
-err:
-	mtk_ahash_unregister(mtk);
-	return ret;
-}
-
-const struct mtk_algo_ops ahash_ops = {
-	.type = CRYPTO_ALG_TYPE_AHASH,
-	.register_algs = mtk_ahash_register,
-	.unregister_algs = mtk_ahash_unregister,
-	.async_req_handle = mtk_ahash_async_req_handle,
+struct mtk_alg_template mtk_alg_sha224 = {
+	.type = MTK_ALG_TYPE_AHASH,
+	.flags = MTK_HASH_SHA224,
+	.alg.ahash = {
+		.init = mtk_ahash_init,
+		.update = mtk_ahash_update,
+		.final = mtk_ahash_final,
+		.finup = mtk_ahash_finup,
+		.digest= mtk_ahash_digest,
+		.export = mtk_ahash_export,
+		.import = mtk_ahash_import,
+		.halg = {
+			.digestsize = SHA224_DIGEST_SIZE,
+			.statesize = sizeof(struct mtk_ahash_export_state),
+			.base = {
+				.cra_name = "sha224",
+				.cra_driver_name = "eip93-sha224",
+				.cra_priority = 300,
+				.cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
+				.cra_blocksize = SHA224_BLOCK_SIZE,
+				.cra_ctxsize = sizeof(struct mtk_ahash_ctx),
+				.cra_init = mtk_ahash_cra_init,
+				.cra_exit = mtk_ahash_cra_exit,
+				.cra_module = THIS_MODULE,
+			},
+		},
+	},
 };
+
+struct mtk_alg_template mtk_alg_sha256 = {
+	.type = MTK_ALG_TYPE_AHASH,
+	.flags = MTK_HASH_SHA256,
+	.alg.ahash = {
+		.init = mtk_ahash_init,
+		.update = mtk_ahash_update,
+		.final = mtk_ahash_final,
+		.finup = mtk_ahash_finup,
+		.digest= mtk_ahash_digest,
+		.export = mtk_ahash_export,
+		.import = mtk_ahash_import,
+		.halg = {
+			.digestsize = SHA256_DIGEST_SIZE,
+			.statesize = sizeof(struct mtk_ahash_export_state),
+			.base = {
+				.cra_name = "sha256",
+				.cra_driver_name = "eip93-sha256",
+				.cra_priority = 300,
+				.cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
+				.cra_blocksize = SHA256_BLOCK_SIZE,
+				.cra_ctxsize = sizeof(struct mtk_ahash_ctx),
+				.cra_init = mtk_ahash_cra_init,
+				.cra_exit = mtk_ahash_cra_exit,
+				.cra_module = THIS_MODULE,
+			},
+		},
+	},
+};
+
+struct mtk_alg_template mtk_alg_hmac_sha1 = {
+	.type = MTK_ALG_TYPE_AHASH,
+	.flags = MTK_HASH_HMAC | MTK_HASH_SHA1,
+	.alg.ahash = {
+		.init = mtk_ahash_init,
+		.update = mtk_ahash_update,
+		.final = mtk_ahash_final,
+		.finup = mtk_ahash_finup,
+		.digest= mtk_ahash_digest,
+		.setkey = mtk_hmac_setkey,
+		.export = mtk_ahash_export,
+		.import = mtk_ahash_import,
+		.halg = {
+			.digestsize = SHA1_DIGEST_SIZE,
+			.statesize = sizeof(struct mtk_ahash_export_state),
+			.base = {
+				.cra_name = "hmac(sha1)",
+				.cra_driver_name = "eip93-hmac-sha1",
+				.cra_priority = 300,
+				.cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
+				.cra_blocksize = SHA1_BLOCK_SIZE,
+				.cra_ctxsize = sizeof(struct mtk_ahash_ctx),
+				.cra_init = mtk_ahash_cra_init,
+				.cra_exit = mtk_ahash_cra_exit,
+				.cra_module = THIS_MODULE,
+			},
+		},
+	},
+};
+
+struct mtk_alg_template mtk_alg_hmac_sha224 = {
+	.type = MTK_ALG_TYPE_AHASH,
+	.flags = MTK_HASH_HMAC | MTK_HASH_SHA224,
+	.alg.ahash = {
+		.init = mtk_ahash_init,
+		.update = mtk_ahash_update,
+		.final = mtk_ahash_final,
+		.finup = mtk_ahash_finup,
+		.digest= mtk_ahash_digest,
+		.setkey = mtk_hmac_setkey,
+		.export = mtk_ahash_export,
+		.import = mtk_ahash_import,
+		.halg = {
+			.digestsize = SHA224_DIGEST_SIZE,
+			.statesize = sizeof(struct mtk_ahash_export_state),
+			.base = {
+				.cra_name = "hmac(sha224)",
+				.cra_driver_name = "eip93-hmac-sha224",
+				.cra_priority = 300,
+				.cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
+				.cra_blocksize = SHA224_BLOCK_SIZE,
+				.cra_ctxsize = sizeof(struct mtk_ahash_ctx),
+				.cra_init = mtk_ahash_cra_init,
+				.cra_exit = mtk_ahash_cra_exit,
+				.cra_module = THIS_MODULE,
+			},
+		},
+	},
+};
+
+struct mtk_alg_template mtk_alg_hmac_sha256 = {
+	.type = MTK_ALG_TYPE_AHASH,
+	.flags = MTK_HASH_HMAC | MTK_HASH_SHA256,
+	.alg.ahash = {
+		.init = mtk_ahash_init,
+		.update = mtk_ahash_update,
+		.final = mtk_ahash_final,
+		.finup = mtk_ahash_finup,
+		.digest= mtk_ahash_digest,
+		.setkey = mtk_hmac_setkey,
+		.export = mtk_ahash_export,
+		.import = mtk_ahash_import,
+		.halg = {
+			.digestsize = SHA1_DIGEST_SIZE,
+			.statesize = sizeof(struct mtk_ahash_export_state),
+			.base = {
+				.cra_name = "hmac(sha256)",
+				.cra_driver_name = "eip93-hmac-sha256",
+				.cra_priority = 300,
+				.cra_flags = CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
+				.cra_blocksize = SHA1_BLOCK_SIZE,
+				.cra_ctxsize = sizeof(struct mtk_ahash_ctx),
+				.cra_init = mtk_ahash_cra_init,
+				.cra_exit = mtk_ahash_cra_exit,
+				.cra_module = THIS_MODULE,
+			},
+		},
+	},
+};
+

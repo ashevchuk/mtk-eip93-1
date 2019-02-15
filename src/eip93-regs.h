@@ -1,14 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright (c) 2018 Richard van Schagen. All rights reserved.
+ * Copyright (C) 2019
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Richard van Schagen <vschagen@cs.com>
  */
 #ifndef REG_EIP93_H
 #define REG_EIP93_H
@@ -37,7 +31,6 @@
 #define EIP93_REG_PE_RD_COUNT		((PE_RNG_BASE)+(0x05 * EIP93_REG_WIDTH))
 #define EIP93_REG_PE_RING_RW_PNTR	((PE_RNG_BASE)+(0x06 * EIP93_REG_WIDTH))
 
-
 //PACKET ENGINE  configuartion registers
 #define PE_CFG_BASE			0x0000100
 #define EIP93_REG_PE_CONFIG		((PE_CFG_BASE)+(0x00 * EIP93_REG_WIDTH))
@@ -55,13 +48,11 @@
 #define CLOCK_BASE			0x01E8
 #define EIP93_REG_PE_CLOCK_CTRL		((CLOCK_BASE)+(0x00 * EIP93_REG_WIDTH))
 
-
 //EIP93 Device Option and Revision Register
 #define REV_BASE			0x01F4
 #define EIP93_REG_PE_OPTION_1		((REV_BASE)+(0x00 * EIP93_REG_WIDTH))
 #define EIP93_REG_PE_OPTION_0		((REV_BASE)+(0x01 * EIP93_REG_WIDTH))
 #define EIP93_REG_PE_REVISION		((REV_BASE)+(0x02 * EIP93_REG_WIDTH))
-
 
 //EIP93 Interrupt Control Register
 #define INT_BASE			0x0200
@@ -110,7 +101,6 @@
 #define EIP93_REG_PRNG_LFSR_0		((PRNG_BASE)+(0x0E * EIP93_REG_WIDTH))
 #define EIP93_REG_PRNG_LFSR_1		((PRNG_BASE)+(0x0F * EIP93_REG_WIDTH))
 
-
 /*-----------------------------------------------------------------------------
  * Constants & masks
  */
@@ -156,7 +146,6 @@
 #define EIP93_LFSR_0			0xDEADC0DE
 #define EIP93_LFSR_1			0xBEEFF00D
 
-
 /*-----------------------------------------------------------------------------
  * EIP93 device initialization specifics
  */
@@ -199,5 +188,3 @@ typedef enum
 #define EIP93_INT_PULSE_CLEAR		0	// 0 = Manual clear
 
 #endif
-
-

@@ -1,39 +1,42 @@
-/*
- * Copyright (c) 2018, Richard van Schagen. All rights reserved.
+/* SPDX-License-Identifier: GPL-2.0
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation.
+ * Copyright (C) 2019
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Richard van Schagen <vschagen@cs.com>
  */
 
 #ifndef _CIPHER_H_
 #define _CIPHER_H_
 
 struct mtk_cipher_ctx {
+	struct mtk_context	base;
 	struct mtk_device	*mtk;
 	u8			key[AES_MAX_KEY_SIZE];
 	u32			keylen;
-	dma_addr_t		phy_key;
 	struct crypto_skcipher	*fallback;
+	/* AEAD specific */
+	bool			aead;
+	unsigned int		authsize;
+	struct crypto_shash	*shash; /* TODO change to ahash */
+	u8			ipad[SHA512_DIGEST_SIZE] __aligned(sizeof(u32));
+	u8			opad[SHA512_DIGEST_SIZE] __aligned(sizeof(u32));
 };
 
 struct mtk_cipher_reqctx {
-	unsigned long		flags;
+	unsigned long	flags;
+	int		textsize;
+	/* AEAD */
+	int		assoclen;
+	int		authsize;
+	u32		odigest[SHA512_DIGEST_SIZE] __aligned(sizeof(u32));
+	/* copy in case of mis-alignment or AEAD if no-consecutive blocks */
+	struct scatterlist	*sg_src;
+	int			src_nents;
+	struct scatterlist	*sg_dst;
+	int			dst_nents;
+	/* AES-CTR in case of counter overflow */
+	struct scatterlist	ctr_src[2];
+	struct scatterlist	ctr_dst[2];
 };
-
-static inline struct mtk_alg_template *to_cipher_tmpl(struct crypto_tfm *tfm)
-{
-	struct crypto_alg *alg = tfm->__crt_alg;
-	return container_of(alg, struct mtk_alg_template, alg.crypto);
-}
-
-extern const struct mtk_algo_ops ablkcipher_ops;
-
-void mtk_cipher_req_done(struct mtk_device *mtk, int ctr);
 
 #endif /* _CIPHER_H_ */

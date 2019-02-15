@@ -1,14 +1,8 @@
-/*
- * Copyright (c) 2018 Richard van Schagen. All rights reserved.
+/* SPDX-License-Identifier: GPL-2.0
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 and
- * only version 2 as published by the Free Software Foundation.
+ * Copyright (C) 2019
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * Richard van Schagen <vschagen@cs.com>
  */
 
 #ifndef _COMMON_H_
@@ -26,7 +20,7 @@
 #include <linux/crypto.h>
 #include <linux/types.h>
 
-#include "core-eip93.h"
+#include "eip93-core.h"
 
 /* key size in bytes */
 #define MTK_SHA_HMAC_KEY_SIZE		64
@@ -50,19 +44,17 @@
 #define MTK_ALG_AES			BIT(2)
 
 /* hash and hmac algorithms */
-#define MTK_HASH_SHA1			BIT(3)
-#define MTK_HASH_SHA256			BIT(4)
-#define MTK_HASH_SHA1_HMAC		BIT(5)
-#define MTK_HASH_SHA256_HMAC		BIT(6)
-#define MTK_HASH_AES_CMAC		BIT(7)
+#define MTK_HASH_MD5			BIT(3)
+#define MTK_HASH_SHA1			BIT(4)
+#define MTK_HASH_SHA224			BIT(5)
+#define MTK_HASH_SHA256			BIT(6)
+#define MTK_HASH_HMAC			BIT(7)
 
 /* cipher modes */
-#define MTK_MODE_CBC			BIT(8)
-#define MTK_MODE_ECB			BIT(9)
-#define MTK_MODE_CTR			BIT(10)
-//#define MTK_MODE_XTS			BIT(11)
-//#define MTK_MODE_CCM			BIT(12)
-//#define MTK_MODE_MASK			GENMASK(12, 8)
+#define MTK_MODE_CBC			BIT(10)
+#define MTK_MODE_ECB			BIT(11)
+#define MTK_MODE_CTR			BIT(12)
+#define MTK_MODE_MASK			GENMASK(10, 12)
 
 /* cipher encryption/decryption operations */
 #define MTK_ENCRYPT			BIT(13)
@@ -72,24 +64,23 @@
 #define IS_3DES(flags)			(flags & MTK_ALG_3DES)
 #define IS_AES(flags)			(flags & MTK_ALG_AES)
 
-#define IS_SHA1(flags)			(flags & MTK_HASH_SHA1)
-#define IS_SHA256(flags)		(flags & MTK_HASH_SHA256)
-#define IS_SHA1_HMAC(flags)		(flags & MTK_HASH_SHA1_HMAC)
-#define IS_SHA256_HMAC(flags)		(flags & MTK_HASH_SHA256_HMAC)
-#define IS_CMAC(flags)			(flags & MTK_HASH_AES_CMAC)
-#define IS_SHA(flags)			(IS_SHA1(flags) || IS_SHA256(flags))
-#define IS_SHA_HMAC(flags)		\
-		(IS_SHA1_HMAC(flags) || IS_SHA256_HMAC(flags))
+#define IS_HASH_MD5(flags)		(flags & MTK_HASH_MD5)
+#define IS_HASH_SHA1(flags)		(flags & MTK_HASH_SHA1)
+#define IS_HASH_SHA224(flags)		(flags & MTK_HASH_SHA224)
+#define IS_HASH_SHA256(flags)		(flags & MTK_HASH_SHA256) 
+#define IS_HMAC(flags)			(flags & MTK_HASH_HMAC)
 
 #define IS_CBC(mode)			(mode & MTK_MODE_CBC)
 #define IS_ECB(mode)			(mode & MTK_MODE_ECB)
 #define IS_CTR(mode)			(mode & MTK_MODE_CTR)
-//#define IS_XTS(mode)			(mode & MTK_MODE_XTS)
-//#define IS_CCM(mode)			(mode & MTK_MODE_CCM)
 
 #define IS_ENCRYPT(dir)			(dir & MTK_ENCRYPT)
 #define IS_DECRYPT(dir)			(dir & MTK_DECRYPT)
 
+#define IS_HASH(flags)			(flags & (MTK_HASH_MD5 || \
+						MTK_HASH_SHA1 || \
+						MTK_HASH_SHA224 || \
+						 MTK_HASH_SHA256))
 
 #define HASH_DIGEST_OUT			0
 #define HASH_DIGEST_IN			1
@@ -98,7 +89,7 @@
 
 #define MTK_RING_SIZE			256
 #define NUM_AES_BYPASS			250
-#define MTK_QUEUE_LENGTH		16
+#define MTK_QUEUE_LENGTH		128
 /*
  * Interrupts of EIP93
  */
@@ -211,69 +202,21 @@ typedef union
 		unsigned int reserved		: 2;
 		unsigned int hostReady		: 1;
 		unsigned int peReady		: 1;
-		unsigned int byPass		: 8;	
+		unsigned int byPass		: 8;
 	} bits;	
 	unsigned int word;		
 } peLength_t;
 
-typedef struct addrHandler_s
+typedef struct eip93_descriptor_s
 {
-	unsigned int	addr;
-	dma_addr_t	phyAddr;
-} addrHandler_t;
-
-typedef struct eip93DescpHandler_s
-{
-	peCrtlStat_t	peCrtlStat;
-	unsigned int	srcAddr;
-	unsigned int	dstAddr;
-	unsigned int	saAddr;
-	unsigned int	stateAddr;
-	unsigned int	arc4Addr;
-	unsigned int	userId;
-	peLength_t	peLength;
-} eip93DescpHandler_t;
-
-typedef struct addrsDigestPreCompute_s
-{
-	unsigned int		*hashKeyTank;
-	addrHandler_t		ipadHandler;
-	addrHandler_t		opadHandler;
-	unsigned int		blkSize;
-	eip93DescpHandler_t	*cmdHandler;
-	addrHandler_t		saHandler;
-	addrHandler_t		stateHandler;
-	addrHandler_t		stateHandler2;
-	unsigned int		digestWord;
-	unsigned int		*pIDigest;
-	unsigned int		*pODigest;
-} addrsDigestPreCompute_t;
-
-typedef struct ipsecEip93Adapter_s
-{
-	unsigned int 		spi; //every ipsec flow has a unique spi
-	struct xfrm_state 	*x; //the SA
-	unsigned int 		isHashPreCompute; //0:pre-compute init, 1:inner digest done, 2:inner digest done, 3:pre-compute done
-	unsigned int 		isEncryptOrDecrypt; //1:encrypt, 2:decrypt
-	struct sk_buff_head	skbQueue;
-	addrsDigestPreCompute_t	*addrsPreCompute; //for hash pre-compute
-	eip93DescpHandler_t	*cmdHandler; //for encrypt/decrypt
-	spinlock_t		lock;
-	unsigned int		addedLen; //refer to ssh_hwaccel_alloc_combined() in safenet_la.c
-} ipsecEip93Adapter_t;
-
-
-struct mtk_alg_template {
-	struct list_head entry;
-	u32 crypto_alg_type;
-	unsigned long alg_flags;
-	const u32 *std_iv;
-	union {
-		struct crypto_alg crypto;
-		struct ahash_alg ahash;
-		struct rng_alg rng;
-	} alg;
-	struct mtk_device *mtk;
-};
+	peCrtlStat_t		peCrtlStat;
+	unsigned int		srcAddr;
+	unsigned int		dstAddr;
+	unsigned int		saAddr;
+	unsigned int		stateAddr;
+	unsigned int		arc4Addr;
+	unsigned int		userId;
+	peLength_t		peLength;
+} eip93_descriptor_t;
 
 #endif /* _COMMON_H_ */
